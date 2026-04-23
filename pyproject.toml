@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openscaw"
+version = "1.0.0"
+description = "自动监控和修复本地 AI Agent 的智能守护工具"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "OpenScaw Team"},
+]
+keywords = ["openclaw", "ai", "agent", "monitor", "guardian", "kimi", "deepseek", "minimax"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "psutil>=5.9.0",
+    "requests>=2.28.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+openscaw = "openscaw.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/openscaw"
+Repository = "https://github.com/yourusername/openscaw"
+Issues = "https://github.com/yourusername/openscaw/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["openscaw*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"

@@ -1,0 +1,50 @@
+name: Health Check Example
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # 每6小时检查一次
+  workflow_dispatch:
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install OpenScaw
+      run: |
+        pip install -e .
+
+    - name: Run Health Check
+      id: health
+      env:
+        KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+      run: |
+        openscaw check --format json > health_report.json || true
+        cat health_report.json
+        echo "status=$(cat health_report.json | jq -r .status 2>/dev/null || echo 'unknown')" >> $GITHUB_OUTPUT
+
+    - name: Upload Health Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: health-report-${{ github.run_number }}
+        path: health_report.json
+        retention-days: 7
+
+    - name: Notify on Failure
+      if: steps.health.outputs.status == 'critical'
+      uses: slackapi/slack-github-action@v1
+      with:
+        payload: |
+          {
+            "text": "OpenScaw 检测到严重问题！请检查健康报告。"
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
