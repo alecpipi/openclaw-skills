@@ -8,6 +8,7 @@ import json
 import asyncio
 import argparse
 import logging
+import io
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -19,11 +20,20 @@ from openscaw import __version__, __description__
 from openscaw.config import ConfigManager
 from openscaw.monitor import OpenClawMonitor, HealthLevel
 from openscaw.fixer import AutoFixer, FixResult
-from openscaw.diagnostics import DiagnosticsEngine
+from openscaw.diagnostics import DiagnosticsEngine, LogDiscoverer
 from openscaw.notifier import Notifier, StatusDashboard, NotifyLevel
 from openscaw.api_client import APIClientManager
 
 # 配置日志
+def _setup_console():
+    """Configure stdout/stderr to handle Unicode on all platforms (fixes GBK crash on Windows)."""
+    if sys.platform == 'win32':
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+_setup_console()
+
 log_dir = Path.home() / ".openscaw"
 log_dir.mkdir(exist_ok=True)
 
@@ -32,7 +42,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(log_dir / "openscaw.log", mode='a')
+        logging.FileHandler(log_dir / "openscaw.log", mode='a', encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -46,6 +56,7 @@ class OpenScawCLI:
         self.monitor: Optional[OpenClawMonitor] = None
         self.fixer: Optional[AutoFixer] = None
         self.diagnostics = DiagnosticsEngine()
+        self.log_discoverer = LogDiscoverer()
         self.notifier = Notifier(self.config.config)
         self.dashboard = StatusDashboard()
         self.api_manager = APIClientManager()
@@ -77,6 +88,7 @@ class OpenScawCLI:
             'status': self.cmd_status,
             'logs': self.cmd_logs,
             'version': self.cmd_version,
+            'revive': self.cmd_revive,
         }
         
         handler = command_map.get(parsed_args.command)
@@ -105,9 +117,10 @@ class OpenScawCLI:
   openscaw init              初始化配置
   openscaw check             执行一次健康检查
   openscaw monitor           启动持续监控
+  openscaw revive            抢救卡死的 OpenClaw 进程
   openscaw fix context       修复上下文过长问题
   openscaw fix api           修复 API Key 问题
-  openscaw doctor            深度诊断并生成报告
+  openscaw doctor            深度诊断并生成报告（含日志分析）
   openscaw test              测试所有 API 连接
   openscaw dashboard         显示状态仪表盘
             """
@@ -136,8 +149,8 @@ class OpenScawCLI:
         
         # fix
         fix_parser = subparsers.add_parser('fix', help='执行修复')
-        fix_parser.add_argument('issue', nargs='?', 
-                               choices=['context', 'api', 'process', 'memory', 'all'],
+        fix_parser.add_argument('issue', nargs='?',
+                               choices=['context', 'api', 'process', 'memory', 'network', 'zombie', 'all'],
                                help='要修复的问题')
         fix_parser.add_argument('--auto', action='store_true', help='自动修复所有问题')
         
@@ -174,7 +187,14 @@ class OpenScawCLI:
         
         # version
         version_parser = subparsers.add_parser('version', help='显示版本信息')
-        
+
+        # revive
+        revive_parser = subparsers.add_parser('revive', help='抢救卡死的 OpenClaw 进程（自动诊断+修复+重启）')
+        revive_parser.add_argument('--force', action='store_true',
+                                   help='强制重启（不尝试恢复）')
+        revive_parser.add_argument('--restart-only', action='store_true',
+                                   help='仅重启，不做诊断')
+
         return parser
     
     async def cmd_init(self, args) -> int:
@@ -336,6 +356,8 @@ class OpenScawCLI:
                 'api': 'api_key_invalid',
                 'process': 'process_stuck',
                 'memory': 'memory_high',
+                'network': 'network_issue',
+                'zombie': 'zombie_process',
                 'all': None
             }
             
@@ -349,8 +371,9 @@ class OpenScawCLI:
             elif args.issue == 'all':
                 # 修复所有可能的问题
                 print("🛠️  执行所有修复...")
-                for issue_name in ['context_overflow', 'api_key_invalid', 
-                                  'process_stuck', 'memory_high']:
+                for issue_name in ['context_overflow', 'api_key_invalid',
+                                  'network_issue', 'memory_high',
+                                  'zombie_process', 'process_stuck']:
                     result = await self.fixer.fix(issue_name)
                     print(f"   {issue_name}: {result.value}")
                 return 0
@@ -427,35 +450,78 @@ class OpenScawCLI:
         return 0 if healthy_count == total else 1
     
     async def cmd_doctor(self, args) -> int:
-        """医生命令 - 深度诊断"""
-        print("👨‍⚕️ OpenScaw 正在诊断...\n")
-        
+        """医生命令 - 深度诊断（含日志分析）"""
+        print("OpenScaw 正在诊断...\n")
+
+        # 扫描日志
+        print("--- 日志扫描 ---")
+        logs = self.log_discoverer.discover_logs()
+        active_log = self.log_discoverer.find_active_log(hours=2)
+        if logs:
+            print(f"   发现 {len(logs)} 个日志文件")
+            for log in logs[:5]:
+                age = self.log_discoverer.format_log_age(log)
+                size = log.stat().st_size / 1024
+                print(f"   - {log.name} ({size:.0f}KB, {age})")
+            if active_log:
+                print(f"\n   最近活跃: {active_log}")
+        else:
+            print("   未找到日志文件")
+        print()
+
         # 收集症状
         self.monitor = OpenClawMonitor(self.config)
         report = await self.monitor.check_health()
-        
+
         symptoms = {
             "errors": report.errors,
             "api_status": report.api_status,
             "context_tokens": report.context_tokens,
             "memory_mb": report.process.memory_mb if report.process else 0,
+            "cpu_percent": report.process.cpu_percent if report.process else 0,
             "response_time_ms": report.response_time_ms,
-            "recent_changes": []  # 可从配置文件修改时间获取
+            "process": report.process,
+            "log_active": report.details.get("log_active"),
+            "recent_changes": [],
         }
-        
-        # 执行诊断
+
+        # 日志分析
+        print("--- 日志异常分析 ---")
+        log_diag = None
+        if active_log:
+            log_lines = self.log_discoverer.tail_log(active_log, n_lines=300)
+            log_diag = self.diagnostics.diagnose_from_logs(log_lines)
+            if log_diag and log_diag.confidence >= 0.5:
+                print(f"   根因: {log_diag.root_cause}")
+                print(f"   置信度: {log_diag.confidence * 100:.0f}%")
+                if log_diag.evidence:
+                    for ev in log_diag.evidence[:3]:
+                        print(f"   - {ev[:120]}")
+            else:
+                print("   日志中未发现明显异常")
+        else:
+            print("   无活跃日志可供分析")
+        print()
+
+        # 系统诊断
+        print("--- 系统诊断 ---")
         diagnosis = self.diagnostics.diagnose(symptoms)
-        
-        # 生成报告
-        report_text = self.diagnostics.generate_report(diagnosis, symptoms)
-        
+
+        # 综合报告：优先采纳日志分析结果
+        if log_diag and log_diag.confidence >= 0.6:
+            final_diag = log_diag
+        else:
+            final_diag = diagnosis
+
+        report_text = self.diagnostics.generate_report(final_diag, symptoms)
+
         if args.output:
             Path(args.output).write_text(report_text, encoding='utf-8')
             print(f"报告已保存到: {args.output}")
-        
+
         print(report_text)
-        
-        return 0 if diagnosis.confidence > 0.7 else 1
+
+        return 0 if final_diag.confidence > 0.7 else 1
     
     async def cmd_report(self, args) -> int:
         """报告命令"""
@@ -565,6 +631,143 @@ class OpenScawCLI:
         print("  - DeepSeek")
         print("  - MiniMax")
         return 0
+
+    async def cmd_revive(self, args) -> int:
+        """抢救命令 — 当 OpenClaw 卡死/无响应时一键恢复"""
+        print("+" + "=" * 58 + "+")
+        print("|" + "        OpenScaw 抢救模式 — 恢复 OpenClaw 进程".ljust(58) + "|")
+        print("+" + "=" * 58 + "+")
+        print()
+
+        self.monitor = OpenClawMonitor(self.config)
+        self.fixer = AutoFixer(self.monitor, self.config)
+
+        # ── Step 1: 检查进程 ──
+        print("[1/5] 检查进程状态...")
+        process = self.monitor._check_process()
+
+        if process:
+            print(f"   PID: {process.pid}")
+            print(f"   名称: {process.name}")
+            print(f"   状态: {process.status}")
+            print(f"   内存: {process.memory_mb:.0f} MB")
+            print(f"   CPU: {process.cpu_percent:.1f}%")
+
+            if process.status == "zombie":
+                print("   [!] 进程是僵尸状态，需强制清理")
+            elif process.cpu_percent < 1 and process.memory_mb > 0:
+                print("   [?] 进程 CPU 使用率极低，可能已挂起")
+        else:
+            print("   进程未运行")
+
+        # ── Step 2: 查找并分析日志 ──
+        print()
+        print("[2/5] 扫描日志文件...")
+        logs = self.log_discoverer.discover_logs()
+        active_log = self.log_discoverer.find_active_log(hours=2)
+
+        if logs:
+            print(f"   发现 {len(logs)} 个日志文件")
+            for log in logs[:5]:
+                age = self.log_discoverer.format_log_age(log)
+                size = log.stat().st_size / 1024
+                print(f"   - {log.name} ({size:.0f}KB, {age})")
+            if active_log:
+                print(f"\n   最近活跃日志: {active_log.name}")
+            else:
+                print("\n   未发现近期活跃的日志文件")
+        else:
+            print("   未发现日志文件")
+
+        if args.restart_only:
+            print("\n   --restart-only 模式，跳过诊断直接重启")
+            print("\n[3/5] 跳过诊断")
+            print("[4/5] 跳过修复")
+        else:
+            # ── Step 3: 日志诊断 ──
+            print()
+            print("[3/5] 日志异常分析...")
+            if active_log:
+                log_lines = self.log_discoverer.tail_log(active_log, n_lines=200)
+                diag = self.diagnostics.diagnose_from_logs(log_lines)
+                if diag and diag.confidence >= 0.5:
+                    print(f"   发现问题: {diag.root_cause}")
+                    print(f"   置信度: {diag.confidence * 100:.0f}%")
+                    if diag.evidence:
+                        print("   证据:")
+                        for ev in diag.evidence[:3]:
+                            print(f"     - {ev[:120]}")
+                    if diag.recommendations:
+                        print("   建议:")
+                        for rec in diag.recommendations[:3]:
+                            print(f"     - {rec}")
+                else:
+                    print("   日志分析未发现明显异常模式")
+            else:
+                print("   无日志可供分析")
+
+            # ── Step 4: 执行修复 ──
+            print()
+            print("[4/5] 执行恢复操作...")
+
+            if process and not args.force:
+                fixes_applied = False
+
+                # 僵尸进程处理
+                if process.status == "zombie":
+                    print("   -> 清理僵尸进程...")
+                    result = await self.fixer.fix("zombie_process")
+                    print(f"      {result.value}")
+                    fixes_applied = True
+
+                # 唤醒尝试
+                print("   -> 尝试唤醒进程...")
+                result = await self.fixer.fix("no_response")
+                print(f"      {result.value}")
+                if result == FixResult.SUCCESS:
+                    fixes_applied = True
+
+                # 检查 API
+                print("   -> 检查 API 连通性...")
+                result = await self.fixer.fix("network_issue")
+                if result == FixResult.FAILED:
+                    print("      [提示] 网络可能不通，请检查代理/VPN 设置")
+                else:
+                    print("      网络正常")
+
+                # 如果唤醒无效，重启
+                if not fixes_applied:
+                    print("   -> 唤醒无效，尝试重启进程...")
+                    result = await self.fixer.fix("process_stuck")
+                    print(f"      {result.value}")
+            else:
+                # 强制重启
+                print("   -> 强制重启进程...")
+                if process:
+                    await self.fixer.fix("zombie_process")
+                result = await self.fixer.fix("process_stuck")
+                print(f"      {result.value}")
+
+        # ── Step 5: 最终检查 ──
+        print()
+        print("[5/5] 验证恢复结果...")
+        await asyncio.sleep(2)
+        report = await self.monitor.check_health()
+
+        if report.level == HealthLevel.HEALTHY:
+            print("\n   [OK] OpenClaw 已成功恢复！")
+            return 0
+        elif report.level == HealthLevel.WARNING:
+            print(f"\n   [!] 进程已恢复但存在警告:")
+            for s in report.suggestions[:3]:
+                print(f"     - {s}")
+            return 1
+        else:
+            print("\n   [FAIL] 恢复失败，建议手动检查:")
+            print("     1. 检查 OpenClaw 是否已安装")
+            print("     2. 检查 API Key 环境变量")
+            print("     3. 查看日志获取详细信息")
+            return 2
 
 
 def main():

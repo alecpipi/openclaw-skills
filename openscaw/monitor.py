@@ -13,6 +13,7 @@ from enum import Enum
 
 from .config import ConfigManager, MonitorConfig
 from .api_client import APIClientManager, APIStatus
+from .diagnostics import LogDiscoverer
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,9 @@ class OpenClawMonitor:
         self._last_context_tokens = 0
         self._error_history: List[str] = []
         self._response_times: List[float] = []
+        self._log_discoverer = LogDiscoverer()
+        self._active_log: Optional[Path] = None
+        self._log_mtime: float = 0
         
     def register_callback(self, callback: Callable):
         """注册状态变化回调"""
@@ -102,31 +106,37 @@ class OpenClawMonitor:
     async def check_health(self) -> HealthReport:
         """执行一次完整健康检查"""
         timestamp = datetime.now()
-        
+
         # 1. 检查进程
         process = self._check_process()
-        
+
         # 2. 检查 API 状态
         api_status = await self._check_apis()
-        
+
         # 3. 检查上下文长度
         context_tokens = self._check_context_length()
-        
+
         # 4. 检查响应时间
         response_time = await self._check_response_time()
-        
+
         # 5. 扫描错误日志
         errors = self._scan_error_logs()
-        
-        # 6. 综合评估
-        level = self._evaluate_health(process, api_status, context_tokens, 
-                                       response_time, errors)
-        
-        # 7. 生成建议
-        suggestions = self._generate_suggestions(
-            level, process, api_status, context_tokens, response_time, errors
+
+        # 6. 检查日志活动（判断进程是否卡死）
+        log_active = self._check_log_activity()
+
+        # 7. 综合评估（传入更多上下文）
+        level = self._evaluate_health(
+            process, api_status, context_tokens,
+            response_time, errors, log_active
         )
-        
+
+        # 8. 生成建议
+        suggestions = self._generate_suggestions(
+            level, process, api_status, context_tokens,
+            response_time, errors, log_active
+        )
+
         report = HealthReport(
             timestamp=timestamp,
             level=level,
@@ -139,22 +149,47 @@ class OpenClawMonitor:
             details={
                 "check_interval": self.monitor_cfg.check_interval,
                 "memory_threshold": self.monitor_cfg.memory_threshold_mb,
-                "context_threshold": self.monitor_cfg.max_context_tokens
+                "context_threshold": self.monitor_cfg.max_context_tokens,
+                "log_active": log_active,
             }
         )
-        
+
         # 记录历史
         if response_time > 0:
             self._response_times.append(response_time)
             if len(self._response_times) > 100:
                 self._response_times = self._response_times[-100:]
-        
+
         return report
     
+    def _check_log_activity(self) -> Optional[bool]:
+        """检查日志文件是否有最近的写入活动。返回 True=活跃, False=已停滞, None=无法判断"""
+        if self._active_log is None or not self._active_log.exists():
+            self._active_log = self._log_discoverer.find_active_log(hours=2)
+            if self._active_log is None:
+                return None
+
+        try:
+            current_mtime = self._active_log.stat().st_mtime
+            if self._log_mtime == 0:
+                self._log_mtime = current_mtime
+                return None  # 首次检查，无法判断
+
+            # 如果日志在监控间隔内被修改过，说明进程仍在活动
+            elapsed = current_mtime - self._log_mtime
+            self._log_mtime = current_mtime
+
+            if elapsed > 0:
+                return True
+            # 多次未更新可能表示卡死（但需要更多证据）
+            return False
+        except OSError:
+            return None
+
     def _check_process(self) -> Optional[ProcessInfo]:
-        """检查目标进程"""
-        for proc in psutil.process_iter(['pid', 'name', 'memory_info', 
-                                          'cpu_percent', 'status', 
+        """检查目标进程（支持 zombie 检测）"""
+        for proc in psutil.process_iter(['pid', 'name', 'memory_info',
+                                          'cpu_percent', 'status',
                                           'create_time', 'cmdline']):
             try:
                 proc_name = proc.info['name'] or ""
@@ -268,73 +303,107 @@ class OpenClawMonitor:
         
         return errors
     
-    def _evaluate_health(self, process, api_status, context_tokens, 
-                         response_time, errors) -> HealthLevel:
+    def _evaluate_health(self, process, api_status, context_tokens,
+                         response_time, errors, log_active=None) -> HealthLevel:
         """评估整体健康状态"""
-        # Critical 条件
+        # CRITICAL: 进程不存在
         if process is None:
             return HealthLevel.CRITICAL
-        
-        if any("invalid" in status or "expired" in status 
+
+        # CRITICAL: 僵尸进程
+        if process and process.status == "zombie":
+            return HealthLevel.CRITICAL
+
+        # CRITICAL: API Key 失效
+        if any("invalid" in status or "expired" in status
                for status in api_status.values()):
             return HealthLevel.CRITICAL
-        
+
+        # CRITICAL: 内存超限 2x
         if process.memory_mb > self.monitor_cfg.memory_threshold_mb * 2:
             return HealthLevel.CRITICAL
-        
-        # Warning 条件
+
+        # CRITICAL: 日志停止更新 + 无响应
+        if log_active is False and response_time > self.monitor_cfg.response_timeout * 1000:
+            return HealthLevel.CRITICAL
+
+        # WARNING: 上下文过长
         if context_tokens > self.monitor_cfg.max_context_tokens * 0.8:
             return HealthLevel.WARNING
-        
+
+        # WARNING: 响应超时
         if response_time > self.monitor_cfg.response_timeout * 1000:
             return HealthLevel.WARNING
-        
+
+        # WARNING: 内存使用偏高
         if process.memory_mb > self.monitor_cfg.memory_threshold_mb:
             return HealthLevel.WARNING
-        
+
+        # WARNING: CPU 过高
         if process.cpu_percent > self.monitor_cfg.cpu_threshold_percent:
             return HealthLevel.WARNING
-        
+
+        # WARNING: 日志有错误
         if errors:
             return HealthLevel.WARNING
-        
+
+        # WARNING: 日志不再更新
+        if log_active is False:
+            return HealthLevel.WARNING
+
         return HealthLevel.HEALTHY
     
-    def _generate_suggestions(self, level, process, api_status, 
-                              context_tokens, response_time, errors) -> List[str]:
-        """生成修复建议"""
+    def _generate_suggestions(self, level, process, api_status,
+                              context_tokens, response_time, errors,
+                              log_active=None) -> List[str]:
+        """生成修复建议（增强版）"""
         suggestions = []
-        
+
         if level == HealthLevel.HEALTHY:
-            suggestions.append("✅ 所有指标正常")
+            suggestions.append("所有指标正常")
             return suggestions
-        
+
         if process is None:
-            suggestions.append("🚨 进程未运行，建议启动 OpenClaw")
+            suggestions.append("进程未运行，建议使用 'openscaw revive' 启动")
             return suggestions
-        
+
+        # 僵尸进程
+        if process.status == "zombie":
+            suggestions.append("进程是僵尸状态，需强制清理后重启")
+            suggestions.append("  使用 'openscaw revive' 自动恢复")
+            return suggestions
+
+        # 日志停止更新 → 进程可能卡死
+        if log_active is False:
+            suggestions.append("日志文件已停止更新 — 进程可能已卡死")
+            suggestions.append("  使用 'openscaw revive' 尝试恢复")
+        elif log_active is True:
+            pass  # 日志仍在写入，进程活着
+
         # 上下文过长
         if context_tokens > self.monitor_cfg.max_context_tokens * 0.8:
-            suggestions.append(f"⚠️ 上下文接近限制 ({context_tokens}/{self.monitor_cfg.max_context_tokens} tokens)")
-            suggestions.append("   建议: 使用 'openscaw fix context' 压缩上下文")
-        
+            suggestions.append(f"上下文接近限制 ({context_tokens}/{self.monitor_cfg.max_context_tokens} tokens)")
+            suggestions.append("  建议: 使用 'openscaw fix context' 压缩上下文")
+
         # API 问题
         for api_name, status in api_status.items():
             if "invalid" in status:
-                suggestions.append(f"🔐 {api_name} API Key 无效，建议更新或切换")
+                suggestions.append(f"{api_name} API Key 无效，建议更新或切换")
             elif "rate" in status:
-                suggestions.append(f"⏰ {api_name} 触发频率限制，建议等待或切换 API")
-        
+                suggestions.append(f"{api_name} 触发频率限制，建议等待或切换 API")
+
         # 响应慢
         if response_time > 10000:
-            suggestions.append(f"🐢 响应较慢 ({response_time:.0f}ms)，可能网络不稳定")
-        
+            suggestions.append(f"响应较慢 ({response_time:.0f}ms)，可能网络不稳定")
+            if response_time > 30000:
+                suggestions.append("  响应极慢，进程可能已挂起，试试 'openscaw revive'")
+
         # 资源使用高
         if process.memory_mb > self.monitor_cfg.memory_threshold_mb:
-            suggestions.append(f"📊 内存使用较高 ({process.memory_mb:.0f}MB)")
-        
+            suggestions.append(f"内存使用较高 ({process.memory_mb:.0f}MB)")
+
         # 错误日志
         if errors:
-            suggestions.append(f"🐛 发现 {len(errors)} 个错误，建议查看日志")
-        
+            suggestions.append(f"发现 {len(errors)} 个错误，建议查看日志")
+
         return suggestions

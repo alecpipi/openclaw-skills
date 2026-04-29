@@ -50,7 +50,7 @@ class TestDiagnosticsEngine:
         assert result.category == IssueCategory.NETWORK
     
     def test_load_patterns(self, engine):
-        patterns = engine._patterns
+        patterns = engine.ERROR_PATTERNS
         assert "context_overflow" in patterns
         assert "api_auth_failed" in patterns
         assert "rate_limit" in patterns

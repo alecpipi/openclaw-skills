@@ -7,6 +7,7 @@ import signal
 import subprocess
 import asyncio
 import logging
+import psutil
 from typing import Dict, List, Optional, Callable
 from enum import Enum
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from .monitor import OpenClawMonitor, HealthLevel, HealthReport
 from .api_client import APIClientManager
 from .config import ConfigManager
+from .diagnostics import DiagnosticsEngine, LogDiscoverer
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,9 @@ class AutoFixer:
         self._fix_history: List[Dict] = []
         self._consecutive_failures: Dict[str, int] = {}
         
+        self.diagnostics = DiagnosticsEngine()
+        self.log_discoverer = LogDiscoverer()
+
         # 注册修复动作
         self.actions = {
             "context_overflow": FixAction(
@@ -70,48 +75,93 @@ class AutoFixer:
                 "内存优化",
                 self._fix_memory_high
             ),
+            "zombie_process": FixAction(
+                "zombie_process",
+                "强制清理僵尸进程",
+                self._fix_zombie_process
+            ),
+            "network_issue": FixAction(
+                "network_issue",
+                "重置网络连接",
+                self._fix_network_issue
+            ),
+            "log_overflow": FixAction(
+                "log_overflow",
+                "清理日志文件",
+                self._fix_log_overflow
+            ),
         }
     
     async def auto_fix(self, report: HealthReport) -> Dict[str, FixResult]:
-        """根据健康报告自动修复问题"""
+        """根据健康报告自动修复问题（增强版：先查日志，再对症下药）"""
         results = {}
-        
+
         if report.level == HealthLevel.HEALTHY:
             return {"status": FixResult.SKIPPED, "reason": "系统健康，无需修复"}
-        
-        # 检查各类问题并修复
+
         fixes_to_try = []
-        
-        # 1. 进程不存在
-        if report.process is None:
+
+        # ── 0. 检测僵尸进程（最高优先级） ──
+        if report.process and report.process.status == "zombie":
+            fixes_to_try.append("zombie_process")
+
+        # ── 1. 进程不存在 ──
+        elif report.process is None:
             fixes_to_try.append("process_stuck")
-        
-        # 2. API Key 失效
-        elif any("invalid" in status for status in report.api_status.values()):
-            fixes_to_try.append("api_key_invalid")
-        
-        # 3. 上下文过长
-        elif report.context_tokens > self.config.get_monitor_config().max_context_tokens * 0.8:
-            fixes_to_try.append("context_overflow")
-        
-        # 4. 无响应
-        elif report.response_time_ms < 0 or report.response_time_ms > 10000:
-            fixes_to_try.append("no_response")
-        
-        # 5. 内存过高
-        elif report.process and report.process.memory_mb > self.config.get_monitor_config().memory_threshold_mb:
-            fixes_to_try.append("memory_high")
-        
+
+        # ── 2. 查日志，根据日志证据选择修复 ──
+        else:
+            active_log = self.log_discoverer.find_active_log(hours=1)
+            if active_log:
+                log_lines = self.log_discoverer.tail_log(active_log, n_lines=200)
+                diag = self.diagnostics.diagnose_from_logs(log_lines)
+                if diag and diag.confidence > 0.6:
+                    log_based = self._map_diagnosis_to_fixes(diag.category.value, report)
+                    fixes_to_try.extend(log_based)
+
+            # ── 3. 备选方案：基于报告指标 ──
+            if not fixes_to_try:
+                # API Key 失效
+                if any("invalid" in status for status in report.api_status.values()):
+                    fixes_to_try.append("api_key_invalid")
+
+                # 上下文过长
+                if report.context_tokens > self.config.get_monitor_config().max_context_tokens * 0.8:
+                    fixes_to_try.append("context_overflow")
+
+                # 无响应（响应时间异常）
+                if report.response_time_ms < 0 or report.response_time_ms > 10000:
+                    fixes_to_try.append("no_response")
+
+                # 内存过高
+                if report.process and report.process.memory_mb > self.config.get_monitor_config().memory_threshold_mb:
+                    fixes_to_try.append("memory_high")
+
+                # 网络问题
+                if report.response_time_ms > 15000:
+                    fixes_to_try.append("network_issue")
+
         # 执行修复
         for fix_name in fixes_to_try:
+            if fix_name not in self.actions:
+                continue
             result = await self.fix(fix_name)
             results[fix_name] = result
-            
-            # 如果修复成功，停止后续修复
             if result == FixResult.SUCCESS:
                 break
-        
+
         return results
+
+    def _map_diagnosis_to_fixes(self, category: str, report) -> List[str]:
+        """将诊断类别映射到修复策略"""
+        mapping = {
+            "api": ["api_key_invalid", "network_issue"],
+            "resource": ["memory_high", "context_overflow", "log_overflow"],
+            "network": ["network_issue", "no_response"],
+            "stuck": ["no_response", "process_stuck"],
+            "config": [],
+        }
+        return mapping.get(category, [])
     
     async def fix(self, issue: str) -> FixResult:
         """执行指定修复"""
@@ -266,18 +316,93 @@ class AutoFixer:
         # 尝试重新启动
         return await self._restart_openclaw()
     
+    async def _fix_zombie_process(self) -> bool:
+        """强制清理僵尸进程"""
+        process = self._find_openclaw_process()
+        if not process:
+            return True  # 没有进程也算清理成功
+
+        pid = process.pid
+        logger.warning("清理僵尸进程 PID=%d", pid)
+
+        try:
+            # 先 SIGTERM
+            os.kill(pid, signal.SIGTERM)
+            await asyncio.sleep(2)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.error("SIGTERM 失败: %s", e)
+
+        try:
+            # 如果还在就 SIGKILL
+            if psutil.pid_exists(pid):
+                os.kill(pid, signal.SIGKILL)
+                await asyncio.sleep(1)
+                logger.info("已 SIGKILL 僵尸进程 %d", pid)
+        except Exception as e:
+            logger.error("SIGKILL 失败: %s", e)
+
+        # 验证是否已清除
+        return not psutil.pid_exists(pid)
+
+    async def _fix_network_issue(self) -> bool:
+        """重置网络连接 — 检查各 API 端点连通性并尝试恢复"""
+        endpoints = [
+            ("Moonshot AI", "api.moonshot.cn", 443),
+            ("DeepSeek", "api.deepseek.com", 443),
+            ("MiniMax", "api.minimax.chat", 443),
+        ]
+
+        all_ok = True
+        for name, host, port in endpoints:
+            try:
+                import socket
+                sock = socket.create_connection((host, port), timeout=5)
+                sock.close()
+                logger.info("网络连通: %s (%s)", name, host)
+            except Exception as e:
+                all_ok = False
+                logger.warning("网络不通: %s (%s): %s", name, host, e)
+
+        if not all_ok:
+            logger.info("检测到网络问题，建议检查代理/VPN 设置")
+            # 注意：这里没法真正重置系统网络，但能报告问题
+        return all_ok
+
+    async def _fix_log_overflow(self) -> bool:
+        """清理过大的日志文件"""
+        log_dir = Path.home() / ".openscaw" / "logs"
+        if not log_dir.exists():
+            log_dir.mkdir(parents=True, exist_ok=True)
+            return True
+
+        rotated = 0
+        for f in log_dir.glob("*.log*"):
+            try:
+                if f.stat().st_size > 5 * 1024 * 1024:  # > 5MB
+                    backup = f.with_suffix(f.suffix + ".old")
+                    f.rename(backup)
+                    rotated += 1
+                    logger.info("已轮转日志: %s (%.1fMB)", f.name, f.stat().st_size / 1024 / 1024)
+            except Exception as e:
+                logger.error("轮转日志失败 %s: %s", f, e)
+
+        return rotated > 0
+
     async def _fix_no_response(self) -> bool:
         """修复无响应 - 发送ping或轻量请求"""
         process = self._find_openclaw_process()
         if not process:
             return False
-        
+
         # 方法1: 发送 SIGCONT (继续被暂停的进程)
         try:
             os.kill(process.pid, signal.SIGCONT)
+            logger.info("已发送 SIGCONT 到 PID %d", process.pid)
         except:
             pass
-        
+
         # 方法2: 测试 API 是否恢复
         for _ in range(3):
             await asyncio.sleep(1)
@@ -286,7 +411,9 @@ class AutoFixer:
                 result = client.test_connection(timeout=3)
                 if result.status.value == "healthy":
                     return True
-        
+
+        # 方法3: 检查网络
+        await self._fix_network_issue()
         return False
     
     async def _fix_memory_high(self) -> bool:
@@ -310,9 +437,7 @@ class AutoFixer:
     
     def _find_openclaw_process(self):
         """查找 OpenClaw 进程"""
-        import psutil
-        import re
-        
+
         patterns = [r"openclaw", r"claude-code", r"opencode", r"hermes.*agent"]
         
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):

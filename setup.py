@@ -17,7 +17,7 @@ requirements = []
 if requirements_path.exists():
     requirements = [
         line.strip() 
-        for line in requirements_path.read_text().split('\n') 
+        for line in requirements_path.read_text(encoding='utf-8').split('\n') 
         if line.strip() and not line.startswith('#')
     ]
 
